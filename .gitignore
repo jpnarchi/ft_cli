@@ -1,0 +1,11 @@
+.ft_cli_creds
+.ft_cli_token.json
+.forethought_creds
+.forethought_token.json
+snapshots/
+ft
+*.token
+*.pem
+*.key
+.DS_Store
+__MACOSX/
