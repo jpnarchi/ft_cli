@@ -158,7 +158,9 @@ func agentChannels(a agent) []string {
 }
 
 // liveChannels returns the channels an agent is actually ACTIVE on, from
-// active_workflow_types (entries like "slack-live") plus email autopilot.
+// active_workflow_types: "slack-live" etc., and plain "email" for email (the
+// dashboard's own channel map). email_autopilot_enabled on the list row isn't
+// used: it can be true while the email configuration is off and not in use.
 func liveChannels(a agent) []string {
 	seen := map[string]bool{}
 	raw, _ := a.Raw["active_workflow_types"].([]any)
@@ -167,9 +169,9 @@ func liveChannels(a agent) []string {
 		if strings.HasSuffix(s, "-live") {
 			seen[strings.TrimSuffix(s, "-live")] = true
 		}
-	}
-	if field(a.Raw, "email_autopilot_enabled") == "true" {
-		seen["email"] = true
+		if s == "email" {
+			seen["email"] = true
+		}
 	}
 	var out []string
 	for ch := range seen {

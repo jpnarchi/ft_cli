@@ -12,21 +12,15 @@ import (
 	"time"
 )
 
+// prettyJSON indents a response for printing, with secrets redacted.
 func prettyJSON(b []byte) string {
 	var v any
 	if json.Unmarshal(b, &v) != nil {
 		return string(b)
 	}
+	v, _ = redact(v)
 	out, _ := json.MarshalIndent(v, "", "  ")
 	return string(out)
-}
-
-func cmdActions(c creds) {
-	b, err := apiGet(c, epActions)
-	if err != nil {
-		fail(err)
-	}
-	fmt.Println(prettyJSON(b))
 }
 
 func cmdVersions(c creds, q string) {
@@ -63,8 +57,8 @@ func cmdStats(c creds, args []string) {
 		return
 	}
 	type row struct {
-		name                         string
-		received, responses, deflect float64
+		name                          string
+		received, responses, deflect  float64
 	}
 	var rows []row
 	for _, a := range agents {
@@ -90,7 +84,7 @@ func cmdSnapshot(c creds) {
 		fail(err)
 	}
 	dir := filepath.Join(snapshotRoot(), time.Now().Format("20060102-1504"))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		fail(err)
 	}
 	ok := 0
@@ -100,8 +94,15 @@ func cmdSnapshot(c creds) {
 			fmt.Fprintf(os.Stderr, "  skip %s: %v\n", a.Name, err)
 			continue
 		}
-		b, _ := json.MarshalIndent(cfg, "", "  ")
-		os.WriteFile(filepath.Join(dir, safeName(a.Name)+"__"+a.ID+".json"), b, 0o644)
+		var v any
+		raw, _ := json.Marshal(cfg)
+		json.Unmarshal(raw, &v)
+		v, _ = redact(v)
+		b, _ := json.MarshalIndent(v, "", "  ")
+		if err := os.WriteFile(filepath.Join(dir, safeName(a.Name)+"__"+a.ID+".json"), b, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "  skip %s: %v\n", a.Name, err)
+			continue
+		}
 		ok++
 	}
 	fmt.Printf("Saved %d/%d agents to %s\n", ok, len(agents), dir)

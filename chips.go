@@ -1,14 +1,18 @@
 // Policy HTML <-> readable text, with chips as {{kind: label}} tokens.
 //
-// FT stores an autoflow policy as HTML; each "/" chip (reroute, action, agent,
-// variable, form) is an inline element carrying data-* attributes. On read we
-// swap every chip for a readable token and remember its exact HTML in a chip
-// map, so a write puts the same element back byte for byte. A NEW token is
-// built by cloning an existing chip of the same kind and pointing it at the
-// target found in the mention-fields list (what the "/" menu shows).
+// FT stores an autoflow policy as HTML; each "/" chip is an empty span, e.g.
+//   <span class="context-variable-node" data-flow-id="flow_abc123" id="<cv id>" name="Persona Verification Passed"></span>
+//   <span class="reroute-node" data-flow-id="flow_def456" id="fallback" name="Fallback" type="hand_off"></span>
+// (seen live 2026-10-21). On read each chip becomes a readable token and its
+// exact HTML is kept in a chip map, so a write puts it back byte for byte.
+// A NEW token reuses an existing chip with the same label (fresh data-flow-id),
+// or, for variables, clones a variable chip and points it at the "/" menu
+// target. Other new kinds (reroutes, actions) need one copy added in the UI,
+// because their type attribute can't be derived safely.
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"html"
 	"regexp"
@@ -20,11 +24,12 @@ import (
 type chipMap map[string]string
 
 var (
-	reChipPair = regexp.MustCompile(`(?s)<(span|mark|a|button|div)\b([^>]*\bdata-[a-zA-Z-]+=[^>]*)>(.*?)</(?:span|mark|a|button|div)>`)
-	reChipVoid = regexp.MustCompile(`<(span|img|input)\b([^>]*\bdata-[a-zA-Z-]+=[^>]*)/>`)
-	reAttr     = regexp.MustCompile(`([a-zA-Z_:-]+)\s*=\s*"([^"]*)"`)
-	reToken    = regexp.MustCompile(`\{\{\s*([a-zA-Z_-]+)\s*:\s*([^}]+?)\s*\}\}`)
-	reAnyTag   = regexp.MustCompile(`<[^>]+>`)
+	reChipPair  = regexp.MustCompile(`(?s)<(span|mark|a|button|div)\b([^>]*\bdata-[a-zA-Z-]+=[^>]*)>(.*?)</(?:span|mark|a|button|div)>`)
+	reChipVoid  = regexp.MustCompile(`<(span|img|input)\b([^>]*\bdata-[a-zA-Z-]+=[^>]*)/>`)
+	reAttr      = regexp.MustCompile(`([a-zA-Z_:-]+)\s*=\s*"([^"]*)"`)
+	reToken     = regexp.MustCompile(`\{\{\s*([a-zA-Z_-]+)\s*:\s*([^}]+?)\s*\}\}`)
+	reAnyTag    = regexp.MustCompile(`<[^>]+>`)
+	reTokenDup  = regexp.MustCompile(`\s+#\d+$`)
 )
 
 func attrs(s string) map[string]string {
@@ -63,7 +68,7 @@ func chipKind(at map[string]string, tag string) string {
 }
 
 func chipLabel(at map[string]string, inner string) string {
-	for _, k := range []string{"data-label", "data-name", "data-display-name", "data-title"} {
+	for _, k := range []string{"data-label", "data-name", "data-display-name", "data-title", "name"} {
 		if v := strings.TrimSpace(at[k]); v != "" {
 			return v
 		}
@@ -131,11 +136,16 @@ func policyToText(h string) (string, chipMap) {
 		case "ul", "ol":
 			if !closing {
 				listStack = append(listStack, tag)
-				olCount = append(olCount, 0)
+				n := 0
+				if st := attrs(h[loc[0]:loc[1]])["start"]; st != "" {
+					fmt.Sscanf(st, "%d", &n)
+					n--
+				}
+				olCount = append(olCount, n)
 			} else if len(listStack) > 0 {
 				listStack, olCount = listStack[:len(listStack)-1], olCount[:len(olCount)-1]
 				if len(listStack) == 0 {
-					out.WriteString("\n")
+					out.WriteString("\n\n") // so a following paragraph isn't read as part of the last item
 				}
 			}
 		case "li":
@@ -189,18 +199,27 @@ func textToPolicy(text string, cm chipMap, targets []mentionTarget) (string, err
 		if m == nil {
 			return tok
 		}
-		kind, label := strings.ToLower(m[1]), strings.TrimSpace(m[2])
-		t, ok := findTarget(targets, kind, label)
-		base, hasTmpl := tmpl[kind]
-		if !ok || !hasTmpl {
-			why := "no chip of this kind exists in the policy yet to copy; add one in the UI once"
-			if !ok {
-				why = "not found in the \"/\" menu (run `ft chips list`)"
+		kind, label := strings.ToLower(m[1]), strings.TrimSpace(reTokenDup.ReplaceAllString(m[2], ""))
+		// same destination already in the policy: copy it with a fresh flow id
+		for et, el := range cm {
+			if em := reToken.FindStringSubmatch(et); em != nil && strings.EqualFold(em[1], kind) &&
+				strings.EqualFold(chipLabel(attrs(el), ""), label) {
+				return setAttr(el, "data-flow-id", newFlowID())
 			}
-			missing = append(missing, fmt.Sprintf("%s → %s", tok, why))
-			return tok
 		}
-		return cloneChip(base, t)
+		base, hasTmpl := tmpl[kind]
+		t, ok := findTarget(targets, kind, label)
+		switch {
+		case kind != "var":
+			missing = append(missing, fmt.Sprintf("%s → new %s chips can't be built safely; add this one in the UI once, then it can be reused", tok, kind))
+		case !ok:
+			missing = append(missing, fmt.Sprintf("%s → not found in the \"/\" menu (run `ft chips list`)", tok))
+		case !hasTmpl:
+			missing = append(missing, fmt.Sprintf("%s → no variable chip in this policy yet to copy; add one in the UI once", tok))
+		default:
+			return cloneChip(base, t)
+		}
+		return tok
 	}
 	// escape text but keep tokens
 	var parts []string
@@ -257,21 +276,24 @@ func textToPolicy(text string, cm chipMap, targets []mentionTarget) (string, err
 		if m := liRe.FindStringSubmatch(line); m != nil {
 			flush()
 			indent := len(m[1])
-			tag := "ul"
+			tag, open := "ul", "<ul><li>"
 			if m[2] != "*" && m[2] != "-" {
-				tag = "ol"
+				tag, open = "ol", "<ol><li>"
+				if n := strings.TrimSuffix(m[2], "."); n != "1" {
+					open = `<ol start="` + n + `"><li>` // a list continuing earlier numbering
+				}
 			}
 			if len(stack) > 0 && stack[len(stack)-1].indent == indent && stack[len(stack)-1].tag == tag {
 				b.WriteString("</li><li>")
 			} else if len(stack) > 0 && stack[len(stack)-1].indent < indent {
-				b.WriteString("<" + tag + "><li>")
+				b.WriteString(open)
 				stack = append(stack, lvl{tag, indent})
 			} else {
 				closeTo(indent)
 				if len(stack) > 0 && stack[len(stack)-1].indent == indent && stack[len(stack)-1].tag == tag {
 					b.WriteString("</li><li>")
 				} else {
-					b.WriteString("<" + tag + "><li>")
+					b.WriteString(open)
 					stack = append(stack, lvl{tag, indent})
 				}
 			}
@@ -308,16 +330,16 @@ func findTarget(ts []mentionTarget, kind, label string) (mentionTarget, bool) {
 	return mentionTarget{}, false
 }
 
-// cloneChip rewrites a template chip element to point at a new target.
+// cloneChip points a template chip at a new target: id and name change, and it
+// gets its own data-flow-id. Older data-* style chips are handled too.
 func cloneChip(el string, t mentionTarget) string {
-	at := attrs(el)
-	var oldInner string
-	if m := reChipPair.FindStringSubmatch(el); m != nil {
-		oldInner = strings.TrimSpace(m[3])
-	}
 	out := el
-	for k, v := range at {
-		if !strings.HasPrefix(k, "data-") {
+	if strings.Contains(el, ` name="`) {
+		out = setAttr(out, "id", t.ID)
+		out = setAttr(out, "name", t.Label)
+	}
+	for k, v := range attrs(el) {
+		if !strings.HasPrefix(k, "data-") || k == "data-flow-id" {
 			continue
 		}
 		switch {
@@ -327,9 +349,30 @@ func cloneChip(el string, t mentionTarget) string {
 			out = strings.Replace(out, fmt.Sprintf(`%s="%s"`, k, v), fmt.Sprintf(`%s="%s"`, k, t.ID), 1)
 		}
 	}
-	// swap the visible inner text (taken from the original, before attr edits)
-	if oldInner != "" && !strings.Contains(oldInner, "<") {
-		out = strings.Replace(out, ">"+oldInner+"<", ">"+html.EscapeString(t.Label)+"<", 1)
+	if strings.Contains(el, ` data-flow-id="`) {
+		out = setAttr(out, "data-flow-id", newFlowID())
+	}
+	if m := reChipPair.FindStringSubmatch(el); m != nil {
+		if inner := strings.TrimSpace(m[3]); inner != "" && !strings.Contains(inner, "<") {
+			out = strings.Replace(out, ">"+inner+"<", ">"+html.EscapeString(t.Label)+"<", 1)
+		}
 	}
 	return out
+}
+
+// setAttr replaces one attribute's value; the leading space keeps "id" from
+// matching "data-flow-id".
+func setAttr(el, name, val string) string {
+	re := regexp.MustCompile(`(\s` + regexp.QuoteMeta(name) + `=")[^"]*(")`)
+	return re.ReplaceAllString(el, "${1}"+strings.ReplaceAll(html.EscapeString(val), "$", "$$")+"${2}")
+}
+
+func newFlowID() string {
+	const abc = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 6)
+	rand.Read(b)
+	for i := range b {
+		b[i] = abc[int(b[i])%len(abc)]
+	}
+	return "flow_" + string(b)
 }

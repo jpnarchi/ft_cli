@@ -53,7 +53,7 @@ func cmdPolicy(c creds, args []string) {
 	}
 	if !textMode {
 		merged, _ := json.MarshalIndent(cfg, "", "  ")
-		fmt.Println(string(merged))
+		fmt.Println(prettyJSON(merged))
 		return
 	}
 	fmt.Printf("# %s  (%s)\n\n", a.Name, a.ID)

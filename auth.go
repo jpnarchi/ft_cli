@@ -1,8 +1,8 @@
 // Cognito authentication for your own Forethought account.
 //
-// Uses the public USER_PASSWORD_AUTH flow (same app client the dashboard uses).
-// If the app client has that flow disabled, Cognito returns InvalidParameter /
-// NotAuthorized and we report it so you can fall back to pasting a token.
+// Uses the SRP flow (USER_SRP_AUTH, see srp.go) on the same app client the
+// dashboard uses, so the password never leaves the machine. After that, the
+// cached refresh token gets new ID tokens without a password.
 package main
 
 import (
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -90,19 +91,29 @@ func ensureToken(c creds) (string, error) {
 	if t.valid() {
 		return t.IDToken, nil
 	}
+	var refreshErr error
 	if t.RefreshToken != "" {
-		if nt, err := refreshLogin(c, t.RefreshToken); err == nil {
-			saveToken(nt)
+		nt, err := refreshLogin(c, t.RefreshToken)
+		if err == nil {
+			if err := saveToken(nt); err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  could not cache the refreshed token: %v\n", err)
+			}
 			return nt.IDToken, nil
 		}
+		refreshErr = err
 	}
 	if c.Password == "" {
+		if refreshErr != nil {
+			return "", fmt.Errorf("token refresh failed (%v); run `ft login`", refreshErr)
+		}
 		return "", fmt.Errorf("session expired and no password on file; run `ft login`")
 	}
 	nt, err := passwordLogin(c)
 	if err != nil {
 		return "", err
 	}
-	saveToken(nt)
+	if err := saveToken(nt); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️  could not cache the token: %v\n", err)
+	}
 	return nt.IDToken, nil
 }

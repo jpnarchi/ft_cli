@@ -1,18 +1,18 @@
 // Email autoflow ("autopilot") model, from the dashboard bundle (2026-10-21):
 //
-//	email config versions : GET  /solve/email/email-builder/intent_definition_id/{id}/email-configurations
-//	draft version         : GET  /solve/email/email-builder/intent-email-configuration/{cfg}/draft
-//	autopilot workflow    : GET  /solve/autopilot/email-configuration/{cfg}/version/{v}/autopilot-workflow
-//	policy                : PUT  /solve/autopilot/autopilot-workflow/{apw}/policy-description   {policy_description}
-//	response limit        : PUT  /solve/autopilot/autopilot-workflow/{apw}/max-responses        {max_responses}
-//	fallback triggers     : PUT  /solve/autopilot/autopilot-workflow/{apw}/bypass-fallback-triggers {bypass_fallback_triggers}
-//	tool (search) config  : PUT  /solve/autopilot/autopilot-workflow/{apw}/tools/{tool}/configuration-fields {configuration_fields}
-//	outline               : GET  /solve/autopilot/autopilot-workflow/{apw}/flow-diagram
-//	name a version        : PUT  /solve/email/email-builder/intent-email-configuration/{cfg}/version/{v}/name {name}
-//	publish               : PUT  .../intent-email-configuration/{cfg}/version/{v}/published     {published, last_modified_date}
-//	autopilot on/off      : PUT  .../intent-email-configuration/{cfg}/version/{v}/autopilot-enabled {autopilot_enabled, last_modified_date}
-//	journey               : POST /solve/email/email-builder/email-workflow/default {intent_definition_id}  (get-or-create, as the UI does)
-//	"/" menu              : GET  /dashboard-controls/solve/v2/workflow-builder/{product}/mention-fields
+//   email config versions : GET  /solve/email/email-builder/intent_definition_id/{id}/email-configurations
+//   draft version         : GET  /solve/email/email-builder/intent-email-configuration/{cfg}/draft
+//   autopilot workflow    : GET  /solve/autopilot/email-configuration/{cfg}/version/{v}/autopilot-workflow
+//   policy                : PUT  /solve/autopilot/autopilot-workflow/{apw}/policy-description   {policy_description}
+//   response limit        : PUT  /solve/autopilot/autopilot-workflow/{apw}/max-responses        {max_responses}
+//   fallback triggers     : PUT  /solve/autopilot/autopilot-workflow/{apw}/bypass-fallback-triggers {bypass_fallback_triggers}
+//   tool (search) config  : PUT  /solve/autopilot/autopilot-workflow/{apw}/tools/{tool}/configuration-fields {configuration_fields}
+//   outline               : GET  /solve/autopilot/autopilot-workflow/{apw}/flow-diagram
+//   name a version        : PUT  /solve/email/email-builder/intent-email-configuration/{cfg}/version/{v}/name {name}
+//   publish               : PUT  .../intent-email-configuration/{cfg}/version/{v}/published     {published, last_modified_date}
+//   autopilot on/off      : PUT  .../intent-email-configuration/{cfg}/version/{v}/autopilot-enabled {autopilot_enabled, last_modified_date}
+//   journey               : POST /solve/email/email-builder/email-workflow/default {intent_definition_id}  (get-or-create, as the UI does)
+//   "/" menu              : GET  /dashboard-controls/solve/v2/workflow-builder/{product}/mention-fields
 package main
 
 import (
@@ -31,13 +31,13 @@ const (
 
 type emailVersion struct {
 	ConfigID, Version, LastModified, By, Name string
-	Published, Draft, Autopilot               bool
-	Raw                                       map[string]any
+	Published, Draft, Autopilot              bool
+	Raw                                      map[string]any
 }
 
 func toVersion(m map[string]any) (emailVersion, bool) {
 	id := field(m, "configuration_id", "intent_email_configuration_id", "email_configuration_id")
-	ver := field(m, "version")
+	ver := field(m, "version", "configuration_version")
 	if id == "" || ver == "" {
 		return emailVersion{}, false
 	}
@@ -50,7 +50,9 @@ func toVersion(m map[string]any) (emailVersion, bool) {
 		LastModified: field(m, "last_modified_date", "last_modified", "updated_at"),
 		By:           field(m, "last_modified_by", "modified_by", "updated_by", "last_modified_by_email", "created_by"),
 		Name:         field(m, "version_name", "name"),
-		Published:    field(m, "is_published", "published") == "true" || strings.EqualFold(field(m, "status"), "published"),
+		// the email-configurations list marks the live version with is_in_use; /draft has is_latest_live_version
+		Published: field(m, "is_published", "published") == "true" || strings.EqualFold(field(m, "status"), "published") ||
+			field(m, "is_in_use") == "true" || field(m, "is_latest_live_version") == "true",
 		Draft:        field(m, "is_draft") == "true" || strings.EqualFold(field(m, "status"), "draft"),
 		Autopilot:    field(m, "autopilot_enabled", "is_autopilot_enabled") == "true",
 		Raw:          m,
@@ -122,9 +124,19 @@ func writableDraft(c creds, a agent) (emailVersion, error) {
 		var dv []emailVersion
 		collectVersions(decodeJSON(b), &dv, map[string]bool{})
 		for _, v := range dv {
-			if !v.Published {
-				return v, nil
+			if v.Published {
+				continue
 			}
+			// The draft often has the same number as the live version. Writing to
+			// it is what the UI's autosave does: checked 2026-10-21 on a live agent,
+			// an autosave edited the v14 autopilot workflow, created no v15,
+			// and set needs_to_be_published; contributors only see it after Publish.
+			for _, p := range vs {
+				if p.Published && p.ConfigID == v.ConfigID && p.Version == v.Version {
+					fmt.Fprintf(os.Stderr, "(writes go to v%s's working copy, like the UI's autosave; live changes only on publish)\n", v.Version)
+				}
+			}
+			return v, nil
 		}
 	}
 	d, err := pickVersion(vs, false)
@@ -150,7 +162,15 @@ func selectVersion(c creds, a agent, o opts) (emailVersion, error) {
 		}
 		return emailVersion{}, fmt.Errorf("version %s not found", v)
 	}
-	return pickVersion(vs, o.has("published"))
+	if o.has("published") {
+		return pickVersion(vs, true)
+	}
+	d, err := pickVersion(vs, false)
+	if err != nil && !o.has("draft") {
+		fmt.Fprintln(os.Stderr, "(no separate draft; showing the live version)")
+		return pickVersion(vs, true)
+	}
+	return d, err
 }
 
 func getAutopilot(c creds, v emailVersion) (map[string]any, error) {
@@ -303,13 +323,14 @@ func cmdAgentGet(c creds, o opts) {
 		fail(err)
 	}
 	if o.has("raw", "json") {
-		fmt.Println(jsonText(map[string]any{"version": v.Raw, "autopilot_workflow": ap}))
+		r, _ := redact(map[string]any{"version": v.Raw, "autopilot_workflow": ap})
+		fmt.Println(jsonText(r))
 		return
 	}
 	text, cm := policyToText(field(ap, "policy_description"))
 	if out := o.val("out", "o"); out != "" {
 		os.WriteFile(out, []byte(text), 0o644)
-		os.WriteFile(out+".chips.json", []byte(jsonText(cm)), 0o644)
+		os.WriteFile(out+".chips.json", []byte(jsonText(cm)), 0o600)
 		fmt.Fprintf(os.Stderr, "wrote %s (+ %s.chips.json)\n", out, out)
 	}
 	desc, phrases, _ := intentInfo(c, a)

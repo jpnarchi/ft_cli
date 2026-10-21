@@ -16,6 +16,7 @@ import (
 type opts struct {
 	pos    []string
 	vals   map[string]string
+	multi  map[string][]string // every value of a repeated flag, in order
 	bools  map[string]bool
 	thread []string
 }
@@ -27,7 +28,7 @@ var boolFlags = map[string]bool{
 }
 
 func parseOpts(args []string) opts {
-	o := opts{vals: map[string]string{}, bools: map[string]bool{}}
+	o := opts{vals: map[string]string{}, multi: map[string][]string{}, bools: map[string]bool{}}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if !strings.HasPrefix(a, "-") || a == "-" {
@@ -37,6 +38,7 @@ func parseOpts(args []string) opts {
 		k := strings.TrimLeft(a, "-")
 		if eq := strings.IndexByte(k, '='); eq > 0 {
 			o.vals[k[:eq]] = k[eq+1:]
+			o.multi[k[:eq]] = append(o.multi[k[:eq]], k[eq+1:])
 			continue
 		}
 		switch {
@@ -56,6 +58,7 @@ func parseOpts(args []string) opts {
 			if i+1 < len(args) {
 				i++
 				o.vals[k] = args[i]
+				o.multi[k] = append(o.multi[k], args[i])
 			} else {
 				o.bools[k] = true
 			}
@@ -107,7 +110,13 @@ func backup(kind, name string, obj any) string {
 	dir := filepath.Join(home(), "ft_backup_"+time.Now().Format("20060102"))
 	os.MkdirAll(dir, 0o700)
 	p := filepath.Join(dir, fmt.Sprintf("%s__%s__%s.json", safeName(name), kind, time.Now().Format("150405")))
-	b, _ := json.MarshalIndent(obj, "", "  ")
+	// round-trip through JSON so redact sees plain maps, then drop secrets:
+	// backups are for reading and diffing, never a place credentials live
+	var plain any
+	raw, _ := json.Marshal(obj)
+	json.Unmarshal(raw, &plain)
+	plain, _ = redact(plain)
+	b, _ := json.MarshalIndent(plain, "", "  ")
 	if err := os.WriteFile(p, b, 0o600); err != nil {
 		fail(fmt.Errorf("backup failed, not writing: %w", err))
 	}

@@ -1,7 +1,9 @@
 // Email preview endpoints (confirmed 2026-10-21):
-//
-//	start : POST /solve/email/preview              multipart
-//	reply : POST /solve/email/preview/{sid}/reply  JSON
+//   start : POST /solve/email/preview              multipart
+//   reply : POST /solve/email/preview/{sid}/reply  JSON
+// The dashboard's preview has no option to mock actions (checked in its bundle
+// 2026-10-21; mocks exist only in FT's separate agent test cases), so a
+// preview runs the agent's real actions. cmdPreview gates on that.
 package main
 
 import (
@@ -14,7 +16,7 @@ const epPreviewStart = "/solve/email/preview"
 
 // startPreview opens a preview thread. a.ID == "" means "auto": no intent
 // filter, so FT predicts the agent like it would for a real email.
-func startPreview(c creds, a agent, query string, mockActions bool) (previewResult, error) {
+func startPreview(c creds, a agent, query string) (previewResult, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 	fields := map[string]string{
@@ -29,10 +31,6 @@ func startPreview(c creds, a agent, query string, mockActions bool) (previewResu
 		fields["email_workflow_id"] = a.Workflow
 		fields["subject"] = "Preview test: " + a.Name
 	}
-	if mockActions {
-		fields["mock_actions"] = "true"
-		fields["create_real_tickets"] = "false"
-	}
 	for k, v := range fields {
 		w.WriteField(k, v)
 	}
@@ -44,16 +42,12 @@ func startPreview(c creds, a agent, query string, mockActions bool) (previewResu
 	return parsePreview(b), nil
 }
 
-func continuePreview(c creds, sid, query string, mockActions bool) (previewResult, error) {
+func continuePreview(c creds, sid, query string) (previewResult, error) {
 	payload := map[string]any{
 		"preview_session_id":                 sid,
 		"reply_text":                         query,
 		"custom_css":                         "",
 		"ai_instruction_filters_for_preview": []any{},
-	}
-	if mockActions {
-		payload["mock_actions"] = true
-		payload["create_real_tickets"] = false
 	}
 	body, _ := json.Marshal(payload)
 	b, err := apiSendRaw(c, "POST", epPreviewStart+"/"+sid+"/reply", "application/json", body)

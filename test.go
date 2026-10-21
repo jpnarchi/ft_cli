@@ -1,8 +1,8 @@
 // Testing commands: run an email preview across several turns and read its
 // logs — the "2-message test" from the daily workflow, scripted.
 //
-// NOTE: the preview endpoint + body are placeholders pending a browser capture
-// (see endpoints_write.go). Once confirmed, only the constants there change.
+// Previews run the agent's REAL actions (FT has no preview mock; see
+// endpoints_write.go), so any tool that can change something needs a typed yes.
 package main
 
 import (
@@ -18,9 +18,6 @@ import (
 
 // apiSend performs an authenticated JSON POST/PUT and returns the body.
 func apiSend(c creds, method, path string, body any) ([]byte, error) {
-	if dashboardAPI == "" {
-		return nil, fmt.Errorf("set FT_API_BASE in ~/.ft_cli_creds")
-	}
 	var raw []byte
 	if body != nil {
 		raw, _ = json.Marshal(body)
@@ -30,6 +27,9 @@ func apiSend(c creds, method, path string, body any) ([]byte, error) {
 
 // apiSendRaw sends raw bytes with a given content type (JSON or multipart).
 func apiSendRaw(c creds, method, path, contentType string, raw []byte) ([]byte, error) {
+	if dashboardAPI == "" {
+		return nil, fmt.Errorf("set FT_API_BASE in ~/.ft_cli_creds")
+	}
 	tok, err := ensureToken(c)
 	if err != nil {
 		return nil, err
@@ -71,7 +71,6 @@ type previewLog struct {
 func cmdPreview(c creds, args []string) {
 	o := parseOpts(args)
 	msgs := o.thread
-	realActions := o.has("real", "real-actions") // default: mock actions so preview never hits Zendesk
 	if len(msgs) == 0 {
 		fail(fmt.Errorf(`usage: ft preview <agent|auto> --channel email --thread "msg 1" "msg 2" … [--real] [--full]`))
 	}
@@ -87,31 +86,94 @@ func cmdPreview(c creds, args []string) {
 	}
 	full = o.has("full")
 
-	if realActions {
-		// Known FT gotcha: the "Create real tickets" toggle does NOT stop custom
-		// actions from firing. --real lets them fire (may create live tickets).
-		fmt.Fprintf(os.Stderr, "⚠️  --real: custom actions WILL fire and may create real tickets / side effects.\n")
-		if !confirm("Run preview with real actions?") {
+	var risky []string
+	if a.ID == "" {
+		risky = []string{"auto routing can pick any agent, including ones whose actions write"}
+	} else {
+		risky = previewSideEffects(c, a)
+	}
+	if len(risky) > 0 {
+		fmt.Fprintln(os.Stderr, "⚠️  Previews run REAL actions (FT has no mock for email previews). These may change something:")
+		for _, r := range risky {
+			fmt.Fprintln(os.Stderr, "   • "+r)
+		}
+		if !confirm("Run the preview anyway?") {
 			fmt.Fprintln(os.Stderr, "cancelled")
 			return
 		}
-	} else {
-		fmt.Fprintln(os.Stderr, "⚠️  asked FT to mock actions, but that flag is NOT confirmed yet: FT may still run them.\n   Don't preview agents whose actions write (e.g. create a Zendesk ticket) until mocking is verified.")
 	}
 
-	conv, err := startPreview(c, a, msgs[0], !realActions)
+	conv, err := startPreview(c, a, msgs[0])
 	if err != nil {
 		fail(err)
 	}
 	printTurn(1, msgs[0], conv)
 	for i, m := range msgs[1:] {
-		conv, err = continuePreview(c, conv.ID, m, !realActions)
+		conv, err = continuePreview(c, conv.ID, m)
 		if err != nil {
 			fail(err)
 		}
 		printTurn(i+2, m, conv)
 	}
 	fmt.Printf("\npreview session: %s\n", conv.ID)
+}
+
+// readOnlyTools are tool/action types that only read or route inside the
+// conversation. Everything else is treated as a possible side effect.
+var readOnlyTools = map[string]bool{
+	"article_suggestion": true, "granular_article_suggestion_action_v2": true, "set_context_variable": true,
+	"context_variable_mapping": true, "parse_jwt": true, "hyperlink_redirect": true, "dynamic_card": true,
+	"knowledge_retrieval": true, "search_help_center": true, "article_search": true,
+}
+
+// previewSideEffects lists the agent's email tools that could change
+// something when the preview runs them. Unknown tools count as risky.
+func previewSideEffects(c creds, a agent) []string {
+	vs, err := emailVersions(c, a)
+	if err != nil {
+		return []string{"couldn't read the agent's tools (" + err.Error() + ")"}
+	}
+	seen := map[string]bool{}
+	var tools []map[string]any
+	for _, v := range vs {
+		ap, err := getAutopilot(c, v)
+		if err != nil {
+			return []string{"couldn't read the agent's tools (" + err.Error() + ")"}
+		}
+		for _, t := range getArr(ap, "tool_definitions", "tools") {
+			if m, ok := t.(map[string]any); ok && !seen[field(m, "tool_id", "id")] {
+				seen[field(m, "tool_id", "id")] = true
+				tools = append(tools, m)
+			}
+		}
+	}
+	byID := map[string]map[string]any{}
+	if as, err := listActions(c); err == nil {
+		for _, x := range as {
+			byID[field(x, "action_id")] = x
+		}
+	}
+	var out []string
+	for _, t := range tools {
+		typ, name := strings.ToLower(field(t, "tool_type", "type")), field(t, "name", "tool_name")
+		blob := typ + " " + strings.ToLower(name)
+		switch {
+		case readOnlyTools[typ] || strings.Contains(blob, "search") || strings.Contains(blob, "article") || strings.Contains(blob, "knowledge"):
+			continue
+		case typ == "api_call" || typ == "api" || typ == "template_api":
+			act := byID[field(t, "tool_id", "id")]
+			method := strings.ToUpper(field(getMap(act, "action_fields"), "method"))
+			if method == "GET" {
+				continue
+			}
+			out = append(out, fmt.Sprintf("%s (API %s)", name, orDash(method)))
+		case typ == "hand_off":
+			out = append(out, name+" (handoff: may assign or update the ticket)")
+		default:
+			out = append(out, fmt.Sprintf("%s (%s)", name, typ))
+		}
+	}
+	return out
 }
 
 // full prints every log message untruncated (preview --full).
@@ -125,8 +187,8 @@ type previewResult struct {
 }
 
 // summarize extracts the salient signals from a preview turn's logs.
-func (p previewResult) intent() string { return p.logFind("Intent Predicted", "Intent identified:") }
-func (p previewResult) fellBack() bool { return p.logHas("Executing Fallback Workflow") }
+func (p previewResult) intent() string   { return p.logFind("Intent Predicted", "Intent identified:") }
+func (p previewResult) fellBack() bool    { return p.logHas("Executing Fallback Workflow") }
 
 func (p previewResult) logHas(title string) bool {
 	for _, l := range p.Logs {

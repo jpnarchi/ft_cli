@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -52,15 +53,24 @@ func cmdSetPolicy(c creds, o opts) {
 	if needsNewChips(string(newText), cm) {
 		targets = mentionTargets(c)
 	}
-	newHTML, err := textToPolicy(string(newText), cm, targets)
+	// safety: the unchanged policy must survive text → HTML byte for byte,
+	// otherwise a write could change markup the user never touched
+	if same, err := textToPolicy(curText, cm, nil); err != nil {
+		fail(fmt.Errorf("can't round-trip %s's current policy (%v); edit it in the UI", a.Name, err))
+	} else if back, _, _ := preserveBlocks(curHTML, same); back != curHTML {
+		fail(fmt.Errorf("can't round-trip %s's current policy losslessly, so a write could change parts you didn't edit; edit it in the UI", a.Name))
+	}
+	genHTML, err := textToPolicy(string(newText), cm, targets)
 	if err != nil {
 		fail(err)
 	}
+	newHTML, kept, rebuilt := preserveBlocks(curHTML, genHTML)
 	rendered, _ := policyToText(newHTML)
 	fmt.Printf("%s — email draft v%s\n\n%s\n", a.Name, v.Version, lineDiff(curText, rendered))
 	if rendered == curText {
 		return
 	}
+	fmt.Printf("\n%d block(s) kept byte for byte, %d rebuilt\n", kept, rebuilt)
 	if !o.has("apply") {
 		dryRunNote("set-policy")
 		return
@@ -140,8 +150,17 @@ func cmdSetSetting(c creds, o opts) {
 		}
 	}
 	fmt.Printf("%s — email draft v%s\n", a.Name, v.Version)
+	var real []change
 	for _, ch := range changes {
+		if ch.from == ch.to || (ch.from == "-" && (ch.to == "off" || ch.to == "none" || ch.to == "0")) {
+			fmt.Printf("  %s: already %s\n", ch.key, ch.from)
+			continue
+		}
 		fmt.Printf("  %s: %s → %s\n", ch.key, ch.from, ch.to)
+		real = append(real, ch)
+	}
+	if changes = real; len(changes) == 0 {
+		return
 	}
 	if !o.has("apply") {
 		dryRunNote("set-setting")
@@ -157,6 +176,15 @@ func cmdSetSetting(c creds, o opts) {
 }
 
 // ---------- search sources ----------
+
+// toolConfig is a tool's settings: GET returns them as tool_fields, while the
+// PUT body names them configuration_fields.
+func toolConfig(t map[string]any) any {
+	if v, ok := t["configuration_fields"]; ok && v != nil {
+		return v
+	}
+	return t["tool_fields"]
+}
 
 func searchTools(ap map[string]any) []map[string]any {
 	var out []map[string]any
@@ -192,8 +220,9 @@ func cmdSearchSourcesGet(c creds, o opts) {
 		return
 	}
 	for _, t := range ts {
-		cf := t["configuration_fields"]
-		js := jsonText(cf)
+		cf := toolConfig(t)
+		rcf, _ := redact(cf)
+		js := jsonText(rcf)
 		public := strings.Contains(strings.ToLower(js), "public")
 		github := strings.Contains(strings.ToLower(js), "github")
 		fmt.Printf("## %s  [tool %s]\npublic-only filter present: %v   GitHub source present: %v\n%s\n\n",
@@ -240,7 +269,13 @@ func cmdSearchSourcesSet(c creds, o opts) {
 	if tool == nil || (len(ts) > 1 && o.val("tool") == "") {
 		fail(fmt.Errorf("pick the search tool with --tool (found %d)", len(ts)))
 	}
-	fmt.Printf("%s — draft v%s, tool %s\n\n%s\n", a.Name, v.Version, field(tool, "tool_id", "id"), lineDiff(jsonText(tool["configuration_fields"]), jsonText(newCF)))
+	shownCur, _ := redact(toolConfig(tool))
+	shownNew, _ := redact(newCF)
+	// [redacted] values from `search-sources get` keep the current secret
+	if newCF, err = restoreSecrets(newCF, toolConfig(tool)); err != nil {
+		fail(err)
+	}
+	fmt.Printf("%s — draft v%s, tool %s\n\n%s\n", a.Name, v.Version, field(tool, "tool_id", "id"), lineDiff(jsonText(shownCur), jsonText(shownNew)))
 	if !o.has("apply") {
 		dryRunNote("search-sources set")
 		return
@@ -285,14 +320,45 @@ func cmdSetIntent(c creds, o opts) {
 			}
 		}
 	}
+	for _, r := range o.multi["remove-phrase"] {
+		var kept []string
+		found := false
+		for _, p := range newPhrases {
+			if strings.EqualFold(strings.TrimSpace(p), strings.TrimSpace(r)) {
+				found = true
+				continue
+			}
+			kept = append(kept, p)
+		}
+		if !found {
+			fail(fmt.Errorf("no training phrase %q on %s (see ft agent get)", r, a.Name))
+		}
+		newPhrases = kept
+	}
+	for _, add := range o.multi["add-phrase"] {
+		add = strings.TrimSpace(add)
+		dup := false
+		for _, p := range newPhrases {
+			if strings.EqualFold(strings.TrimSpace(p), add) {
+				dup = true
+			}
+		}
+		if dup {
+			fmt.Fprintf(os.Stderr, "(%q is already a training phrase; skipped)\n", add)
+		} else if add != "" {
+			newPhrases = append(newPhrases, add)
+		}
+	}
 	before := fmt.Sprintf("name: %s\ndescription:\n%s\nphrases:\n%s", a.Name, desc, strings.Join(phrases, "\n"))
 	after := fmt.Sprintf("name: %s\ndescription:\n%s\nphrases:\n%s", newName, newDesc, strings.Join(newPhrases, "\n"))
 	fmt.Println(lineDiff(before, after))
 	if before == after {
 		return
 	}
-	if !o.has("apply") {
-		dryRunNote("set-intent")
+	// the Edit Agent dialog has no draft: name, description and phrases change
+	// routing for every live channel as soon as they're saved
+	if !o.has("confirm") {
+		fmt.Fprintln(os.Stderr, "\nNo change made. This is live at once (no draft; it changes routing on every channel). Re-run with --confirm once it's approved.")
 		return
 	}
 	bk := backup("intent", a.Name, raw)
@@ -355,9 +421,14 @@ func cmdVersionSave(c creds, o opts) {
 	}
 	// local snapshot = a real restore point even if FT keeps editing this version
 	dir := filepath.Join(home(), "ft_versions", safeName(a.Name))
-	os.MkdirAll(dir, 0o700)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fail(fmt.Errorf("restore point not saved: %w", err))
+	}
 	p := filepath.Join(dir, safeName(name)+".json")
-	os.WriteFile(p, []byte(jsonText(map[string]any{"saved_at": time.Now().Format(time.RFC3339), "version": v.Raw, "autopilot_workflow": ap})), 0o600)
+	snap, _ := redact(map[string]any{"saved_at": time.Now().Format(time.RFC3339), "version": v.Raw, "autopilot_workflow": ap})
+	if err := os.WriteFile(p, []byte(jsonText(snap)), 0o600); err != nil {
+		fail(fmt.Errorf("restore point not saved: %w", err))
+	}
 	if _, err := apiSend(c, "PUT", fmt.Sprintf("%s/intent-email-configuration/%s/version/%s/name", emailBuilder, v.ConfigID, v.Version), map[string]any{"name": name}); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠️  named locally only; FT rename failed: %v\n", err)
 	}
@@ -417,9 +488,11 @@ func cmdVersionRestore(c creds, o opts) {
 		id := field(m, "tool_id", "id")
 		if cur, ok := dstTools[id]; !ok {
 			fmt.Printf("  ⚠️  tool %s exists in the restore point but not in the draft — re-add it in the UI\n", field(m, "tool_name", "name"))
-		} else if jsonText(cur["configuration_fields"]) != jsonText(m["configuration_fields"]) {
+		} else if cfg, err := restoreSecrets(toolConfig(m), toolConfig(cur)); err != nil {
+			fmt.Printf("  ⚠️  tool %s: %v — its configuration will not be restored\n", field(m, "tool_name", "name"), err)
+		} else if jsonText(toolConfig(cur)) != jsonText(cfg) {
 			fmt.Printf("  tool %s configuration will be restored\n", field(m, "tool_name", "name"))
-			toolUpdates = append(toolUpdates, m)
+			toolUpdates = append(toolUpdates, map[string]any{"tool_id": id, "tool_name": field(m, "tool_name", "name"), "configuration_fields": cfg})
 		}
 	}
 	if !o.has("apply") {
@@ -435,10 +508,20 @@ func cmdVersionRestore(c creds, o opts) {
 		f, _ := strconv.ParseFloat(s, 64)
 		mr = int(f)
 	}
-	apwPut(c, dst, "max-responses", map[string]any{"max_responses": mr})
-	apwPut(c, dst, "bypass-fallback-triggers", map[string]any{"bypass_fallback_triggers": field(src, "bypass_fallback_triggers") == "true"})
+	var failed []string
+	if err := apwPut(c, dst, "max-responses", map[string]any{"max_responses": mr}); err != nil {
+		failed = append(failed, fmt.Sprintf("response_limit: %v", err))
+	}
+	if err := apwPut(c, dst, "bypass-fallback-triggers", map[string]any{"bypass_fallback_triggers": field(src, "bypass_fallback_triggers") == "true"}); err != nil {
+		failed = append(failed, fmt.Sprintf("bypass_fallback_triggers: %v", err))
+	}
 	for _, t := range toolUpdates {
-		apwPut(c, dst, "tools/"+field(t, "tool_id", "id")+"/configuration-fields", map[string]any{"configuration_fields": t["configuration_fields"]})
+		if err := apwPut(c, dst, "tools/"+field(t, "tool_id", "id")+"/configuration-fields", map[string]any{"configuration_fields": toolConfig(t)}); err != nil {
+			failed = append(failed, fmt.Sprintf("tool %s: %v", field(t, "tool_name", "name"), err))
+		}
+	}
+	if len(failed) > 0 {
+		fail(fmt.Errorf("policy restored into draft v%s, but these parts failed (backup: %s):\n  %s", d.Version, bk, strings.Join(failed, "\n  ")))
 	}
 	fmt.Printf("✅ restored into draft v%s. Backup: %s\n", d.Version, bk)
 }
@@ -465,10 +548,12 @@ func cmdPublish(c creds, o opts) {
 	vs, _ := emailVersions(c, a)
 	var pubText string
 	var pubAP map[string]any
-	if p, err := pickVersion(vs, true); err == nil {
-		if pubAP, err = getAutopilot(c, p); err == nil {
-			pubText, _ = policyToText(field(pubAP, "policy_description"))
-		}
+	if p, err := pickVersion(vs, true); err != nil {
+		fmt.Fprintln(os.Stderr, "⚠️  no published version found; the diff below compares against an empty policy")
+	} else if pubAP, err = getAutopilot(c, p); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️  could not read the published v%s (%v); the diff below compares against an empty policy\n", p.Version, err)
+	} else {
+		pubText, _ = policyToText(field(pubAP, "policy_description"))
 	}
 	draftText, _ := policyToText(field(dap, "policy_description"))
 	fmt.Printf("Publish %s email draft v%s → live\n\n## Policy (published → draft)\n%s\n\n## response_limit: %s → %s\n",
@@ -485,10 +570,15 @@ func cmdPublish(c creds, o opts) {
 	fmt.Printf("✅ %s email v%s published. Backup: %s\n", a.Name, d.Version, bk)
 }
 
-// publishWorkflow activates the latest workflow version on a non-email channel.
+// publishWorkflow activates the latest workflow version on a non-email channel
+// (the dashboard's activate call with a version: {version, workflow_types}).
 func publishWorkflow(c creds, a agent, o opts) {
 	ch := o.channel()
-	b, err := apiGet(c, fmt.Sprintf("/dashboard-controls/solve/v2/workflow-builder/%s/versions/latest", a.Workflow))
+	types, wf, err := channelWorkflow(a, ch)
+	if err != nil {
+		fail(err)
+	}
+	b, err := apiGet(c, fmt.Sprintf("/dashboard-controls/solve/v2/workflow-builder/%s/versions/latest", wf))
 	if err != nil {
 		fail(err)
 	}
@@ -496,46 +586,73 @@ func publishWorkflow(c creds, a agent, o opts) {
 	if latest == "" {
 		fail(fmt.Errorf("could not read latest version for %s", a.Name))
 	}
-	types := withType(activeTypes(a), ch+"-live", true)
-	fmt.Printf("Publish %s v%s on %s → workflow_types %v\n", a.Name, latest, ch, types)
+	fmt.Printf("Publish %s v%s on %s (workflow %s, types %v)\n", a.Name, latest, ch, wf, types)
 	if !o.has("confirm") {
 		fmt.Fprintln(os.Stderr, "\nNot published. Re-run with --confirm once approved for this agent.")
 		return
 	}
 	bk := backup("prepublish_"+ch, a.Name, a.Raw)
-	activate(c, a, latest, types)
+	n, _ := strconv.Atoi(latest)
+	if _, err := apiSend(c, "PUT", fmt.Sprintf("%s/workflow/%s/activate", wfBuilder, wf), map[string]any{"version": n, "workflow_types": types}); err != nil {
+		fail(err)
+	}
 	fmt.Printf("✅ published. Backup: %s\n", bk)
 }
 
 // ---------- channel on/off (gated) ----------
 
-func activeTypes(a agent) []string {
-	var out []string
-	for _, v := range getArr(a.Raw, "active_workflow_types") {
-		out = append(out, fmt.Sprint(v))
-	}
-	return out
+const wfBuilder = "/dashboard-controls/solve/v2/workflow-builder"
+
+// channelTypes is the dashboard's channel → workflow_types map (its bundle,
+// 2026-10-21). Note the widget is "flamethrower" internally.
+var channelTypes = map[string][]string{
+	"widget": {"flamethrower-preview", "flamethrower-live"}, "slack": {"slack-live", "slack-preview"},
+	"api": {"api-live", "api-preview"}, "voice": {"voice-live", "voice-preview"},
+	"web_call": {"web-call-live", "web-call-preview"}, "playbook": {"playbook-live", "playbook-preview"},
+	"interactive_email": {"interactive-email-live", "interactive-email-preview"},
 }
 
-func withType(ts []string, t string, on bool) []string {
-	var out []string
-	for _, x := range ts {
-		if x != t {
-			out = append(out, x)
+// channelWFField is where each channel's workflow id lives on the agents-list
+// row; like the dashboard, a missing one falls back to intent_workflow_id.
+var channelWFField = map[string]string{
+	"api": "api_workflow_id", "playbook": "playbook_workflow_id", "slack": "slack_workflow_id",
+	"voice": "voice_workflow_id", "web_call": "web_call_workflow_id", "widget": "widget_workflow_id",
+	"interactive_email": "interactive_email_workflow_id",
+}
+
+func channelWorkflow(a agent, ch string) ([]string, string, error) {
+	ch = strings.ReplaceAll(strings.ToLower(ch), "-", "_")
+	if ch == "webcall" {
+		ch = "web_call"
+	}
+	types, ok := channelTypes[ch]
+	if !ok {
+		var names []string
+		for k := range channelTypes {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		return nil, "", fmt.Errorf("unknown channel %q (email, %s)", ch, strings.Join(names, ", "))
+	}
+	wf := field(a.Raw, channelWFField[ch])
+	if wf == "" {
+		wf = field(a.Raw, "intent_workflow_id")
+	}
+	if wf == "" {
+		return nil, "", fmt.Errorf("no %s workflow id for %s", ch, a.Name)
+	}
+	return types, wf, nil
+}
+
+func isLiveOn(a agent, types []string) bool {
+	for _, v := range getArr(a.Raw, "active_workflow_types") {
+		for _, t := range types {
+			if fmt.Sprint(v) == t && strings.HasSuffix(t, "-live") {
+				return true
+			}
 		}
 	}
-	if on {
-		out = append(out, t)
-	}
-	return out
-}
-
-func activate(c creds, a agent, version string, types []string) {
-	n, _ := strconv.Atoi(version)
-	if _, err := apiSend(c, "PUT", fmt.Sprintf("/dashboard-controls/solve/v2/workflow-builder/workflow/%s/activate", a.Workflow),
-		map[string]any{"version": n, "workflow_types": types}); err != nil {
-		fail(err)
-	}
+	return false
 }
 
 func cmdChannel(c creds, state string, o opts) {
@@ -571,20 +688,29 @@ func cmdChannel(c creds, state string, o opts) {
 		fmt.Printf("✅ %s email is now %s. Backup: %s\n", a.Name, strings.ToUpper(state), bk)
 		return
 	}
-	version := o.val("version")
-	if version == "" {
-		version = field(a.Raw, "active_version", "published_version", "workflow_version")
+	// other channels: what the dashboard's toggle does, PUT …/workflow/{id}/activate
+	// or /deactivate with that channel's workflow_types (a delta, not the full list)
+	types, wf, err := channelWorkflow(a, ch)
+	if err != nil {
+		fail(err)
 	}
-	if version == "" {
-		fail(fmt.Errorf("pass --version N (the version that should stay live; see ft agent versions %q --channel %s)", a.Name, ch))
+	now := isLiveOn(a, types)
+	fmt.Printf("%s %s: %v → %v (workflow %s, types %v)\n", a.Name, ch, now, on, wf, types)
+	if now == on {
+		fmt.Println("already in that state; nothing to do")
+		return
 	}
-	types := withType(activeTypes(a), ch+"-live", on)
-	fmt.Printf("%s %s: workflow_types %v → %v (v%s)\n", a.Name, ch, activeTypes(a), types, version)
 	if !o.has("confirm") {
 		fmt.Fprintln(os.Stderr, "\nNo change made. Re-run with --confirm once approved for this agent.")
 		return
 	}
 	bk := backup("channel_"+ch, a.Name, a.Raw)
-	activate(c, a, version, types)
-	fmt.Printf("✅ done. Backup: %s\n", bk)
+	verb := "deactivate"
+	if on {
+		verb = "activate"
+	}
+	if _, err := apiSend(c, "PUT", fmt.Sprintf("%s/workflow/%s/%s", wfBuilder, wf, verb), map[string]any{"workflow_types": types}); err != nil {
+		fail(err)
+	}
+	fmt.Printf("✅ %s %s is now %s. Backup: %s\n", a.Name, ch, strings.ToUpper(state), bk)
 }
